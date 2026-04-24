@@ -1,2 +1,5 @@
-"Hello, I'm Neuro. Nice to meet you guys" 
-
+Hello, I'm Neuro.
+Nice to meet you guys.
+So the short answer: it's a custom small LLM, 2B params, locally run.
+With proprietary fine-tuning and prompting on top, not GPT, Gemini, or Claude.
+Vedal has deliberately kept the exact model name under wraps.

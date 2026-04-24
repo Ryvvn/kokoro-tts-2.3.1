@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # Standard library imports
+import asyncio
 import os
 import sys
 import itertools
@@ -12,7 +13,6 @@ import warnings
 from threading import Event
 import re
 import importlib.metadata
-import librosa
 
 # Third-party imports
 import numpy as np
@@ -43,7 +43,7 @@ def check_required_files(model_path="kokoro-v1.0.onnx", voices_path="voices-v1.0
     }
     
     missing_files = []
-    for filepath, download_url in required_files.items():
+    for filepath, download_url in required_files.items():   
         if not os.path.exists(filepath):
             missing_files.append((filepath, download_url))
     
@@ -93,10 +93,15 @@ def pitch_shift_audio(audio, sr, n_steps=0):
     """
     if n_steps == 0:
         return audio
-    return librosa.effects.pitch_shift(audio, sr=sr, n_steps=n_steps)
+    return librosa.effects.pitch_shift(
+        audio, sr=sr, n_steps=n_steps,
+        res_type='soxr_hq',
+        n_fft=512,      # smaller FFT = less smearing on transients
+        hop_length=128  # smaller hop = finer time resolution
+    )
 
 def apply_ashley_voice(audio, sr):
-    """Apply Ashley voice characteristics: +6 semitones (≈25% pitch up).
+    """Apply Ashley voice characteristics: +4 semitones (≈25% pitch up).
 
     Args:
         audio: Audio waveform as numpy array
@@ -264,7 +269,7 @@ def validate_voice(voice, kokoro):
         # Handle built-in voice presets
         if voice == "ashley_neuro":
             # Convert ashley_neuro preset to the actual blend
-            voice = "af_sarah:60,af_bella:40"
+            voice = "af_sky:50,af_sarah:50"
             # Fall through to blend handling below
 
         # Parse comma seperated voices for blend
@@ -825,6 +830,9 @@ def process_chunk_sequential(chunk: str, kokoro: Kokoro, voice, speed: float, la
                 samples, sr = process_chunk_sequential(piece, kokoro, voice, speed, lang, 
                                                      retry_count + 1, debug)
                 if samples is not None:
+                    # Add a short silence buffer between chunks (~50ms)
+                    silence = [0.0] * int(sample_rate * 0.05)
+                    all_samples.extend(silence)
                     all_samples.extend(samples)
                     last_sample_rate = sr
             
@@ -984,7 +992,10 @@ def convert_text_to_audio(input_file, output_file=None, voice=None, speed=1.0, l
         for chapter in chapters:
             print(f"\nStreaming: {chapter['title']}")
             chunks = chunk_text(chapter['content'], initial_chunk_size=1000)
-            asyncio.run(stream_audio(kokoro, chapter['content'], voice, speed, lang, debug))
+            asyncio.run(stream_audio(
+                kokoro, chapter['content'], voice, speed, lang, debug,
+                apply_pitch_shift=(original_voice_request == "ashley_neuro")
+            ))
     else:
         if split_output:
             os.makedirs(split_output, exist_ok=True)
@@ -1097,6 +1108,9 @@ def convert_text_to_audio(input_file, output_file=None, voice=None, speed=1.0, l
                         if samples is not None:
                             if sample_rate is None:
                                 sample_rate = sr
+                                # Add a short silence buffer between chunks (~50ms)
+                            silence = [0.0] * int(sample_rate * 0.05)
+                            all_samples.extend(silence)
                             all_samples.extend(samples)
                             processed_chunks += 1
                     except Exception as e:
@@ -1114,39 +1128,129 @@ def convert_text_to_audio(input_file, output_file=None, voice=None, speed=1.0, l
                 sf.write(output_file, all_samples, sample_rate)
                 print(f"Created {output_file}")
 
-async def stream_audio(kokoro, text, voice, speed, lang, debug=False):
-    global stop_spinner, stop_audio
-    stop_spinner = False
+def chunk_text_for_streaming(text):
+    """Split text into sentence-level chunks for low-latency streaming."""
+     # Strip surrounding quotes from each quoted segment
+    text = text.replace('"', ' ').replace('"', ' ').replace('"', ' ')
+    
+    # Now split on sentence endings and newlines
+    sentences = re.split(r'(?<=[.!?])\s+|\n+', text.strip())
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        # Group short sentences together, split long ones
+        if len(current) + len(sentence) < 100:
+            current += " " + sentence if current else sentence
+        else:
+            if current:
+                chunks.append(current.strip())
+            # If single sentence still too long, split by comma
+            if len(sentence) > 100:
+                sub = sentence.split(',')
+                for s in sub:
+                    if s.strip():
+                        chunks.append(s.strip())
+            else:
+                current = sentence
+    
+    if current:
+        chunks.append(current.strip())
+    
+    return chunks
+async def stream_audio(kokoro, text, voice, speed, lang, debug=False, apply_pitch_shift=False):
+    global stop_audio
     stop_audio = False
-    
+
     print("Starting audio stream...")
-    chunks = chunk_text(text, initial_chunk_size=1000)
-    
-    for i, chunk in enumerate(chunks, 1):
-        if stop_audio:
-            break
-        # Update progress percentage
-        progress = int((i / len(chunks)) * 100)
-        spinner_thread = threading.Thread(
-            target=spinning_wheel, 
-            args=(f"Streaming chunk {i}/{len(chunks)}",)
-        )
-        spinner_thread.start()
-        
-        async for samples, sample_rate in kokoro.create_stream(
+    chunks = chunk_text_for_streaming(text)
+    audio_queue = asyncio.Queue(maxsize=8)
+
+    async def generate_chunk(chunk):
+        """Generate full audio for one chunk and return as single array."""
+        all_samples = []
+        sample_rate = None
+        async for samples, sr in kokoro.create_stream(
             chunk, voice=voice, speed=speed, lang=lang
         ):
             if stop_audio:
                 break
+            if apply_pitch_shift and samples is not None:
+                samples = apply_ashley_voice(np.array(samples), sr)
+            all_samples.extend(samples)
+            sample_rate = sr
+        return np.array(all_samples, dtype='float32'), sample_rate
+
+    async def producer():
+        for i, chunk in enumerate(chunks, 1):
+            if stop_audio:
+                break
             if debug:
-                print(f"\nDEBUG: Playing chunk of {len(samples)} samples")
-            sd.play(samples, sample_rate, blocking=True)
-            # sd.wait()
-        
-        stop_spinner = True
-        spinner_thread.join()
-        stop_spinner = False
-    
+                print(f"\nDEBUG: Generating chunk {i}/{len(chunks)}: {chunk[:50]}...")
+
+            samples, sr = await generate_chunk(chunk)
+            if samples is not None and len(samples) > 0:
+                await audio_queue.put((samples, sr))
+
+        await audio_queue.put(None)
+
+    async def consumer():
+        loop = asyncio.get_event_loop()
+        output_stream = None
+        chunk_num = 0
+
+        try:
+            # Wait for first 2 chunks to buffer before opening stream
+            # This ensures chunk 2 is ready before chunk 1 finishes playing
+            buffered = []
+            for _ in range(min(2, len(chunks))):
+                item = await audio_queue.get()
+                if item is None:
+                    break
+                buffered.append(item)
+
+            # Open stream with known sample rate
+            if buffered:
+                sr = buffered[0][1]
+                output_stream = sd.OutputStream(
+                    samplerate=sr,
+                    channels=1,
+                    dtype='float32',
+                    blocksize=2048
+                )
+                output_stream.start()
+                if debug:
+                    print(f"\nDEBUG: Opened output stream at {sr}Hz")
+
+            # Play pre-buffered chunks
+            for samples, sr in buffered:
+                chunk_num += 1
+                if debug:
+                    print(f"\nDEBUG: Playing chunk {chunk_num}/{len(chunks)}")
+                await loop.run_in_executor(None, output_stream.write, samples)
+
+            # Play remaining chunks as they arrive
+            while True:
+                item = await audio_queue.get()
+                if item is None:
+                    break
+                if stop_audio:
+                    break
+                samples, sr = item
+                chunk_num += 1
+                if debug:
+                    print(f"\nDEBUG: Playing chunk {chunk_num}/{len(chunks)}")
+                await loop.run_in_executor(None, output_stream.write, samples)
+
+        finally:
+            if output_stream:
+                await asyncio.sleep(0.5)
+                output_stream.stop()
+                output_stream.close()
+
+    await asyncio.gather(producer(), consumer())
     print("\nStreaming completed.")
 
 def handle_ctrl_c(signum, frame):

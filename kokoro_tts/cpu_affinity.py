@@ -48,10 +48,10 @@ def set_e_core_affinity(cpu_mask=None):
 
     try:
         if cpu_mask is None:
-            cpu_mask = list(range(16, 24))  # E-cores: 16-23 on i9-13900KS
+            cpu_mask = list(range(16, 32))  # E-cores: 16-23 on i9-13900KS
 
         process = psutil.Process(os.getpid())
-        process.cpu_affinity(cpu_mask)
+        process.cpu_affinity(cpu_mask)      
         return True
     except Exception:
         return False

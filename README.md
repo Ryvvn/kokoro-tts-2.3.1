@@ -289,3 +289,9 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Acknowledgments
 
 - [Kokoro-ONNX](https://github.com/thewh1teagle/kokoro-onnx)
+
+# Full quality (310MB) - what you had before
+curl -L -o kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+
+# Voices (required regardless of model)
+curl -L -o voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
